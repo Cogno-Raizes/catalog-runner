@@ -148,7 +148,7 @@ $AUTH = ['Authorization: Bearer '.$token];
 //////////////////// 2) GET datasets ////////////////////
 try {
     // catálogo (docs: GET /producto/getCatalogo?lang=2)
-    $cat   = http_json('GET', "$BASE_URL/producto/getCatalogo", $AUTH);
+    $cat   = http_json('GET', "$BASE_URL/producto/getCatalogo", $AUTH, null, ['lang'=>$LANG]);
     // stock   (docs: GET /producto/getStock)
     $stock = http_json('GET', "$BASE_URL/producto/getStock", $AUTH);
     // unidades(docs: GET /producto/getUnidadMedida)
