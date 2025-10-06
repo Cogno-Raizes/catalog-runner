@@ -1,5 +1,26 @@
 <?php declare(strict_types=1);
 
+// === RODA BEM EM WEB E EM CLI ===
+if (!isset($argv) || !is_array($argv)) {
+    // Quando corre via web, $argv não existe.
+    $argv = [];
+}
+
+// Função para escrever logs de erro em web/CLI de forma transparente
+if (!function_exists('stderr_write')) {
+    function stderr_write(string $msg): void {
+        if (PHP_SAPI === 'cli') {
+            // Em CLI, usa STDERR nativo se existir
+            if (defined('STDERR')) {
+                fwrite(STDERR, $msg);
+                return;
+            }
+        }
+        // Em web (ou fallback), usa o error_log
+        error_log($msg);
+    }
+}
+
 // ---------------------------- Config ----------------------------
 $ROOT = __DIR__;
 $DIRS = [
