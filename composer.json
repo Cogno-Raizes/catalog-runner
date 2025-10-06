@@ -1,0 +1,14 @@
+{
+  "name": "natural-systems/runner",
+  "description": "Runner: fetch Natural Systems -> CSV por marca -> upload para Google Drive",
+  "type": "project",
+  "require": {
+    "php": "^8.1",
+    "google/apiclient": "^2.15"
+  },
+  "autoload": {
+    "psr-4": {
+      "App\\": "src/"
+    }
+  }
+}

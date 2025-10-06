@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: catalog-runner
+    env: docker
+    plan: free
+    dockerfilePath: Dockerfile
+    envVars:
+      - key: RUN_SECRET
+        sync: false
+      - key: NATURALSYSTEMS_API_KEY
+        sync: false
+      - key: DRIVE_FOLDER_ID
+        sync: false
+      - key: GOOGLE_APPLICATION_CREDENTIALS
+        value: /etc/secrets/gcp-key.json
+      - key: TZ
+        value: Europe/Lisbon
+    secretFiles:
+      - name: gcp-key.json
+        path: /etc/secrets/gcp-key.json
