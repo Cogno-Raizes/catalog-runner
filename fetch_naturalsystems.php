@@ -1,35 +1,4 @@
-#!/usr/bin/env php
-<?php
-/**
- * Natural Systems daily fetcher (macOS-friendly, single-file).
- *
- * What it does:
- *  - Logs in with API key to get a 24h bearer token (auto-cached, auto-refresh).
- *  - Fetches catalog (lang=2), stock, units (weight in KG), and prices.
- *  - Merges by itemCode.
- *  - Converts weight to grams (adds "weight_grams" but keeps original "weight" from API).
- *  - Groups by manufacturer into 4 CSVs: Milwaukee, Garden HighPro, Qnubu, Zerum.
- *  - Generates a small HTML dashboard with counts & links to the CSVs.
- *  - Writes a log file for each run.
- *
- * Usage:
- *   php fetch_naturalsystems.php            # run once
- *   php fetch_naturalsystems.php --lang=2   # force language (default 2)
- *
- * Configure:
- *   Put your API key in .env as NATURALSYSTEMS_API_KEY="...".
- *
- * Notes:
- * - Endpoints (all require Bearer):
- *     POST /login { apiKey }
- *     GET  /producto/getCatalogo   (supports lang)
- *     GET  /producto/getStock
- *     GET  /producto/getUnidadMedida
- *     GET  /producto/getPrecio
- * - Based on docs: https://doc.api.naturalsystems.es/en
- */
-
-declare(strict_types=1);
+<?php declare(strict_types=1);
 
 // ---------------------------- Config ----------------------------
 $ROOT = __DIR__;
