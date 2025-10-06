@@ -135,20 +135,30 @@ function http_json_get(string $url, array $headers = [], int $timeout = 120): ar
 //
 // ==== 1) Login para obter token (24h) =======================================
 //
+// ==== 1) Login para obter token (24h) ====
 try {
     write_log('Login: a obter token…');
-    $loginResp = http_json_post(NS_BASE . '/login', ['apikey' => $API_KEY]);
-    // Ajusta a chave conforme a resposta real (ex.: ["token"=>"..."] ou ["data"=>["token"=>"..."]])
+
+    // Sanitizar key (remove aspas/brancos acidentais)
+    $API_KEY = trim((string)$API_KEY);
+    $API_KEY = trim($API_KEY, "\"' \t\n\r");
+
+    // A doc oficial usa "apiKey" (camelCase)
+    $loginResp = http_json_post(
+        NS_BASE . '/login',
+        ['apiKey' => $API_KEY],      // <- aqui é "apiKey"
+        ['Content-Type: application/json', 'Accept: application/json']
+    );
+
     $token = $loginResp['token'] ?? ($loginResp['data']['token'] ?? null);
-    if (!$token) {
-        throw new RuntimeException('Token não encontrado na resposta de login.');
-    }
+    if (!$token) throw new RuntimeException('Token não encontrado na resposta de login.');
     write_log('Login OK: token obtido.');
 } catch (Throwable $e) {
     write_log('ERRO no login: ' . $e->getMessage());
     http_response_code(500);
     echo json_encode(['ok'=>false, 'error'=>'Falha no login: '.$e->getMessage()]); exit;
 }
+
 
 $authHeaders = ['Authorization: Bearer ' . $token, 'Accept: application/json'];
 
