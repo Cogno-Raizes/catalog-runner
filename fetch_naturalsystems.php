@@ -5,6 +5,10 @@ if (!isset($argv) || !is_array($argv)) {
     // Quando corre via web, $argv não existe.
     $argv = [];
 }
+// Atalho opcional: alias simples para minimizar mudanças
+if (!function_exists('fwrite_stderr')) {
+    function fwrite_stderr($s) { stderr_write((string)$s); }
+}
 
 // Função para escrever logs de erro em web/CLI de forma transparente
 if (!function_exists('stderr_write')) {
