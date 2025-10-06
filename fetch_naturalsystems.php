@@ -4,7 +4,7 @@
  * Natural Systems Fetcher — Web/CLI safe (PHP 8+)
  *
  * - Login: POST /login  body: { "apiKey": "<ENV NATURALSYSTEMS_API_KEY>" }
- * - GET /producto/getCatalogo?lang=2
+ * - GET /producto/getCatalogo            (sem ?lang=2, conforme pedido)
  * - GET /producto/getStock
  * - GET /producto/getUnidadMedida
  * - GET /producto/getPrecio
@@ -110,11 +110,9 @@ function http_json(string $method, string $url, array $headers = [], ?array $jso
     return ['status' => $status, 'headers' => $rawHeaders, 'body' => $body, 'json' => $json];
 }
 
-//////////////////// Config API (conforme docs) ////////////////////
-// Base e endpoints (docs: https://doc.api.naturalsystems.es/en)
+//////////////////// Config API ////////////////////
 $BASE_URL  = 'https://api.naturalsystems.es/api';
 $API_KEY   = getenv('NATURALSYSTEMS_API_KEY') ?: '';
-$LANG      = (int)(getenv('NS_LANG') ?: 2);
 
 if (!$API_KEY) {
     log_line('ERRO: NATURALSYSTEMS_API_KEY ausente.');
@@ -145,15 +143,15 @@ try {
 
 $AUTH = ['Authorization: Bearer '.$token];
 
-//////////////////// 2) GET datasets ////////////////////
+//////////////////// 2) GET datasets (catalogo sem ?lang) ////////////////////
 try {
-    // catálogo (docs: GET /producto/getCatalogo?lang=2)
-    $cat   = http_json('GET', "$BASE_URL/producto/getCatalogo", $AUTH, null, ['lang'=>$LANG]);
-    // stock   (docs: GET /producto/getStock)
+    // catálogo (SEM ?lang=2)
+    $cat   = http_json('GET', "$BASE_URL/producto/getCatalogo", $AUTH);
+    // stock
     $stock = http_json('GET', "$BASE_URL/producto/getStock", $AUTH);
-    // unidades(docs: GET /producto/getUnidadMedida)
+    // unidades
     $uoms  = http_json('GET', "$BASE_URL/producto/getUnidadMedida", $AUTH);
-    // preços  (docs: GET /producto/getPrecio)
+    // preços
     $price = http_json('GET', "$BASE_URL/producto/getPrecio", $AUTH);
 
     foreach (['cat'=>$cat,'stock'=>$stock,'uoms'=>$uoms,'price'=>$price] as $k=>$r) {
