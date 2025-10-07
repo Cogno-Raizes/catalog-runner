@@ -4,12 +4,12 @@
  * Natural Systems Fetcher — Web/CLI safe (PHP 8+)
  *
  * - Login: POST /login  body: { "apiKey": "<ENV NATURALSYSTEMS_API_KEY>" }
- * - GET /producto/getCatalogo            (sem ?lang=2, conforme pedido)
+ * - GET /producto/getCatalogo  com body JSON { "lang": 2 }  (sim, GET com corpo)
  * - GET /producto/getStock
  * - GET /producto/getUnidadMedida
  * - GET /producto/getPrecio
  *
- * Merge por itemCode; peso kg→grams; exporta 4 CSVs por marca com cabeçalho:
+ * Merge por itemCode; peso kg→grams; exporta 4 CSVs por marca:
  *   SKU, Title, Stock, PriceWholesale, Price, Weight
  *
  * ENV obrigatória:
@@ -51,7 +51,14 @@ function log_line(string $line): void {
     error_log('[catalog-runner] ' . $line); // aparece nos logs da Render
 }
 
-function http_json(string $method, string $url, array $headers = [], ?array $jsonBody = null, ?array $query = null, int $timeout = 60): array {
+function http_json(
+    string $method,
+    string $url,
+    array $headers = [],
+    ?array $jsonBody = null,
+    ?array $query = null,
+    int $timeout = 60
+): array {
     $ch = curl_init();
 
     // Query string
@@ -78,11 +85,12 @@ function http_json(string $method, string $url, array $headers = [], ?array $jso
         $opts[CURLOPT_CUSTOMREQUEST] = $m;
     }
 
+    // IMPORTANTE: permitir body JSON mesmo em GET (este fornecedor usa!)
     if ($jsonBody !== null) {
         $payload = json_encode($jsonBody, JSON_UNESCAPED_UNICODE);
         $opts[CURLOPT_POSTFIELDS] = $payload;
-        // Garante Content-Type correto
-        $opts[CURLOPT_HTTPHEADER][] = 'Content-Type: application/json';
+        $hdrs[] = 'Content-Type: application/json';
+        $opts[CURLOPT_HTTPHEADER] = $hdrs;
     }
 
     curl_setopt_array($ch, $opts);
@@ -143,15 +151,13 @@ try {
 
 $AUTH = ['Authorization: Bearer '.$token];
 
-//////////////////// 2) GET datasets (catalogo sem ?lang) ////////////////////
+//////////////////// 2) GET datasets (cat com body JSON lang=2) ////////////////////
 try {
-    // catálogo (SEM ?lang=2)
-    $cat   = http_json('GET', "$BASE_URL/producto/getCatalogo", $AUTH);
-    // stock
+    // getCatalogo: GET com body JSON { "lang": 2 } (como no teu exemplo Guzzle)
+    $cat = get_with_body_json_retry("$BASE_URL/producto/getCatalogo", $AUTH, ['lang'=>2], 3);
+
     $stock = http_json('GET', "$BASE_URL/producto/getStock", $AUTH);
-    // unidades
     $uoms  = http_json('GET', "$BASE_URL/producto/getUnidadMedida", $AUTH);
-    // preços
     $price = http_json('GET', "$BASE_URL/producto/getPrecio", $AUTH);
 
     foreach (['cat'=>$cat,'stock'=>$stock,'uoms'=>$uoms,'price'=>$price] as $k=>$r) {
@@ -168,6 +174,28 @@ try {
     log_line('ERRO a obter dados: '.$e->getMessage());
     http_response_code(500);
     echo json_encode(['ok'=>false,'error'=>'Falha a obter dados: '.$e->getMessage()]); exit;
+}
+
+function get_with_body_json_retry(string $url, array $authHeaders, array $body, int $maxAttempts = 3): array {
+    $delayMs = [500, 1000, 2000]; // 0.5s, 1s, 2s
+    $attempt = 0;
+    while (true) {
+        $attempt++;
+        try {
+            $r = http_json('GET', $url, $authHeaders, $body);
+            if ($r['status'] === 200 && is_array($r['json'])) {
+                return $r;
+            }
+            // se não veio 200/JSON, lança para cair no retry
+            throw new RuntimeException("HTTP {$r['status']}: ".substr($r['body'],0,300));
+        } catch (Throwable $e) {
+            if ($attempt >= $maxAttempts) {
+                throw new RuntimeException("getCatalogo falhou após $attempt tentativas: ".$e->getMessage());
+            }
+            log_line("getCatalogo tentativa $attempt falhou: ".$e->getMessage()." — retry…");
+            usleep($delayMs[$attempt-1] * 1000);
+        }
+    }
 }
 
 //////////////////// 3) Merge por itemCode + peso grams ////////////////////
