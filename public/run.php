@@ -1,50 +1,59 @@
 <?php declare(strict_types=1);
 
-// Executa o fetch e devolve as URLs dos CSV gerados, para o Zapier fazer download.
+// run.php — versão silenciosa para cron
+// Uso normal (cron): /run.php?key=...        -> "OK 4 files (2025-10-08 06:00:02)"
+// Debug (ver JSON e URLs): /run.php?key=...&verbose=1
 
-header('Content-Type: application/json');
+// Nunca “spamar” o output
+ini_set('display_errors', '0');
+ini_set('log_errors', '1');
+
 date_default_timezone_set(getenv('TZ') ?: 'Europe/Lisbon');
 
-// 1) segurança
+// -------- segurança --------
 $secret = getenv('RUN_SECRET') ?: '';
 if (($t = $_GET['key'] ?? '') !== $secret) {
   http_response_code(401);
-  echo json_encode(['ok' => false, 'error' => 'unauthorized']); exit;
+  header('Content-Type: text/plain; charset=utf-8');
+  echo "unauthorized\n"; exit;
 }
 
-// 2) corre o fetch (gera CSVs em ./output/csv/) — descartando qualquer output do ficheiro
-try {
-  $before = glob(__DIR__ . '/../output/csv/*.csv') ?: [];
+// -------- corre o fetch descartando qualquer eco --------
+$before = glob(__DIR__ . '/../output/csv/*.csv') ?: [];
 
-  // Captura e descarta qualquer echo do fetch_naturalsystems.php
-  ob_start();
-  include __DIR__ . '/../fetch_naturalsystems.php';
-  ob_end_clean();
+ob_start();
+include __DIR__ . '/../fetch_naturalsystems.php'; // se este imprimir algo, vamos descartar
+ob_end_clean();
 
-  $after  = glob(__DIR__ . '/../output/csv/*.csv') ?: [];
-  $candidates = array_diff($after, $before) ?: $after; // se não houver delta, envia todos
-} catch (Throwable $e) {
-  http_response_code(500);
-  echo json_encode(['ok'=>false,'error'=>'Falha a gerar CSVs: '.$e->getMessage()]); exit;
-}
+$after = glob(__DIR__ . '/../output/csv/*.csv') ?: [];
+$candidates = array_values(array_diff($after, $before));
+if (!$candidates) $candidates = $after; // se não houve delta, reporta os existentes
 
-// 3) construir URLs absolutas para cada CSV
-function base_url(): string {
+// -------- modos de saída --------
+$verbose = isset($_GET['verbose']);
+if ($verbose) {
+  header('Content-Type: application/json; charset=utf-8');
+
+  // construir URLs apenas em modo verbose
   $proto = (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https' || (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')) ? 'https' : 'http';
   $host  = $_SERVER['HTTP_HOST'] ?? 'localhost';
-  return $proto.'://'.$host;
+  $base  = $proto.'://'.$host;
+
+  $urls = array_map(function($p) use ($base, $secret) {
+    $name = basename($p);
+    return $base.'/files.php?name='.rawurlencode($name).'&key='.$secret;
+  }, $candidates);
+
+  echo json_encode([
+    'ok'        => true,
+    'csvCount'  => count($candidates),
+    'csvFiles'  => array_map('basename', $candidates),
+    'fileUrls'  => $urls,
+    'ts'        => date('Y-m-d H:i:s'),
+  ], JSON_PRETTY_PRINT);
+  exit;
 }
 
-$urls = [];
-foreach ($candidates as $csvPath) {
-  $name = basename($csvPath);
-  $urls[] = base_url().'/files.php?name='.rawurlencode($name).'&key='.$secret;
-}
-
-// 4) resposta limpa (apenas um JSON)
-echo json_encode([
-  'ok'        => true,
-  'csvCount'  => count($candidates),
-  'csvFiles'  => array_map('basename', $candidates),
-  'fileUrls'  => $urls,   // <- é isto que o Zapier vai “loopar”
-], JSON_PRETTY_PRINT);
+// Saída minimal para cron (texto curto)
+header('Content-Type: text/plain; charset=utf-8');
+echo 'OK '.count($candidates).' files ('.date('Y-m-d H:i:s').")\n";
