@@ -3,20 +3,26 @@
 /**
  * Natural Systems Fetcher — Web/CLI safe (PHP 8+)
  *
- * ALTERAÇÕES:
- * - "Price"      => vem de GET /producto/getPrecio (JSON), campo **pvp**
- * - "Wholesale"  => vem de GET /producto/getCsv (CSV), coluna **PVP**
+ * Alterações pedidas:
+ *  - "Price"   = vem de getPrecio.pvp
+ *  - "PriceWholesale" = vem de getCsv (CSV) campo PVP
  *
- * Endpoints usados:
- * - POST /login                        body: { "apiKey": "<ENV NATURALSYSTEMS_API_KEY>" }
- * - GET  /producto/getCatalogo         body JSON: { "lang": 2 }   (sim, GET com corpo)
- * - GET  /producto/getStock
- * - GET  /producto/getUnidadMedida
- * - GET  /producto/getPrecio
- * - GET  /producto/getCsv              (resposta em CSV)
+ * Endpoints:
+ *  - POST /login  body: { "apiKey": "<ENV NATURALSYSTEMS_API_KEY>" }
+ *  - GET  /producto/getCatalogo   (GET com body JSON { "lang": 2 })
+ *  - GET  /producto/getStock
+ *  - GET  /producto/getUnidadMedida
+ *  - GET  /producto/getPrecio
+ *  - GET  /producto/getCsv        (GET com body JSON { "lang": 2 })  <-- NOVO
  *
- * Export por marca (Milwaukee, Garden HighPro, Qnubu, Zerum):
+ * Merge por itemCode; peso kg→grams; exporta 4 CSVs por marca:
  *   SKU, Title, Stock, PriceWholesale, Price, Weight
+ *
+ * ENV obrigatória:
+ *   NATURALSYSTEMS_API_KEY
+ *
+ * Pastas:
+ *   ./output/csv, ./output/logs, ./output/dashboard (com fallback para /tmp)
  */
 
 //////////////////// Setup básico (web/CLI) ////////////////////
@@ -48,10 +54,10 @@ function log_line(string $line): void {
     $msg = "[$ts] $line\n";
     @file_put_contents($RUN_LOG, $msg, FILE_APPEND);
     @file_put_contents($APP_LOG, $msg, FILE_APPEND);
-    error_log('[catalog-runner] ' . $line); // aparece nos logs da plataforma
+    error_log('[catalog-runner] ' . $line); // aparece nos logs da Render
 }
 
-//////////////////// HTTP helpers (JSON e CSV) ////////////////////
+//////////////////// HTTP helper (aceita body em GET) ////////////////////
 function http_json(
     string $method,
     string $url,
@@ -85,7 +91,6 @@ function http_json(
         $opts[CURLOPT_CUSTOMREQUEST] = $m;
     }
 
-    // este fornecedor aceita body JSON em GET (getCatalogo)
     if ($jsonBody !== null) {
         $payload = json_encode($jsonBody, JSON_UNESCAPED_UNICODE);
         $opts[CURLOPT_POSTFIELDS] = $payload;
@@ -114,91 +119,28 @@ function http_json(
         if (json_last_error() === JSON_ERROR_NONE) $json = $j;
     }
 
-    log_line(sprintf("%s %s -> %d (%s)", $m, $url, $status, $json !== null ? 'json' : 'text'));
+    log_line(sprintf("%s %s -> %d (%s)", strtoupper($method), $url, $status, $json !== null ? 'json' : 'text'));
     return ['status' => $status, 'headers' => $rawHeaders, 'body' => $body, 'json' => $json];
 }
 
-function http_raw(
-    string $method,
-    string $url,
-    array $headers = [],
-    ?array $query = null,
-    int $timeout = 60
-): array {
-    $ch = curl_init();
-
-    if ($query && count($query)) {
-        $sep = (str_contains($url, '?') ? '&' : '?');
-        $url .= $sep . http_build_query($query);
-    }
-
-    $opts = [
-        CURLOPT_URL            => $url,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HEADER         => true,
-        CURLOPT_TIMEOUT        => $timeout,
-        CURLOPT_CONNECTTIMEOUT => 20,
-        CURLOPT_HTTPHEADER     => $headers,
-    ];
-
-    $m = strtoupper($method);
-    if ($m === 'POST') {
-        $opts[CURLOPT_POST] = true;
-    } else {
-        $opts[CURLOPT_CUSTOMREQUEST] = $m;
-    }
-
-    curl_setopt_array($ch, $opts);
-    $response = curl_exec($ch);
-    if ($response === false) {
-        $err = curl_error($ch);
-        curl_close($ch);
-        throw new RuntimeException("Network error: $err");
-    }
-    $status     = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-    curl_close($ch);
-
-    $rawHeaders = substr($response, 0, $headerSize);
-    $body       = substr($response, $headerSize);
-
-    log_line(sprintf("%s %s -> %d (raw)", $m, $url, $status));
-    return ['status' => $status, 'headers' => $rawHeaders, 'body' => $body];
-}
-
-//////////////////// CSV helpers ////////////////////
-function autodetect_delimiter(string $headerLine): string {
-    $cComma = substr_count($headerLine, ',');
-    $cSemi  = substr_count($headerLine, ';');
-    $cTab   = substr_count($headerLine, "\t");
-    $max = max($cComma, $cSemi, $cTab);
-    if ($max === $cSemi)  return ';';
-    if ($max === $cTab)   return "\t";
-    return ','; // default
-}
-
-function parse_csv_rows(string $csv): array {
-    $lines = preg_split("/\r\n|\n|\r/", $csv);
-    if (!$lines || count($lines) < 1) return [];
-    $delim = autodetect_delimiter($lines[0]);
-
-    // headers
-    $headers = str_getcsv($lines[0], $delim);
-    $headers = array_map(static fn($h) => trim((string)$h), $headers);
-    $rows = [];
-
-    for ($i = 1; $i < count($lines); $i++) {
-        if ($lines[$i] === '' || $lines[$i] === false) continue;
-        $vals = str_getcsv($lines[$i], $delim);
-        if (!$vals || count($vals) === 1 && $vals[0] === null) continue;
-
-        $row = [];
-        foreach ($headers as $k => $h) {
-            $row[$h] = $vals[$k] ?? null;
+// GET com body JSON + retry (para /producto/getCatalogo e /producto/getCsv)
+function get_with_body_json_retry(string $url, array $authHeaders, array $body, int $maxAttempts = 3): array {
+    $delayMs = [500, 1000, 2000]; // 0.5s, 1s, 2s
+    $attempt = 0;
+    while (true) {
+        $attempt++;
+        try {
+            $r = http_json('GET', $url, $authHeaders, $body);
+            if ($r['status'] === 200) return $r;
+            throw new RuntimeException("HTTP {$r['status']}: ".substr($r['body'],0,300));
+        } catch (Throwable $e) {
+            if ($attempt >= $maxAttempts) {
+                throw new RuntimeException("GET body-json falhou após $attempt tentativas: ".$e->getMessage());
+            }
+            log_line("GET body-json tentativa $attempt falhou: ".$e->getMessage()." — retry…");
+            usleep($delayMs[$attempt-1] * 1000);
         }
-        $rows[] = $row;
     }
-    return $rows;
 }
 
 //////////////////// Config API ////////////////////
@@ -234,65 +176,123 @@ $AUTH = ['Authorization: Bearer '.$token];
 
 //////////////////// 2) GET datasets ////////////////////
 try {
-    // getCatalogo — GET com body JSON {lang:2}, com retry
-    $cat = get_with_body_json_retry("$BASE_URL/producto/getCatalogo", $AUTH, ['lang'=>2], 3);
+    // getCatalogo: GET com body JSON { "lang": 2 }
+    $cat   = get_with_body_json_retry("$BASE_URL/producto/getCatalogo", $AUTH, ['lang'=>2], 3);
+    // stock
+    $stock = http_json('GET', "$BASE_URL/producto/getStock", $AUTH);
+    // unidades
+    $uoms  = http_json('GET', "$BASE_URL/producto/getUnidadMedida", $AUTH);
+    // preços (JSON) — contem "price" e "pvp"
+    $price = http_json('GET', "$BASE_URL/producto/getPrecio", $AUTH);
+    // CSV (com PVP para PriceWholesale)
+    $csv   = get_with_body_json_retry("$BASE_URL/producto/getCsv", $AUTH, ['lang'=>2], 3);
 
-    $stock  = http_json('GET', "$BASE_URL/producto/getStock", $AUTH);
-    $uoms   = http_json('GET', "$BASE_URL/producto/getUnidadMedida", $AUTH);
-    $precio = http_json('GET', "$BASE_URL/producto/getPrecio", $AUTH);
-
-    // Novo: catálogo CSV (para PriceWholesale = coluna PVP)
-    $csvRes = http_raw('GET', "$BASE_URL/producto/getCsv", array_merge($AUTH, ['Accept: text/csv,*/*;q=0.8']));
-    if ($csvRes['status'] !== 200) {
-        throw new RuntimeException("getCsv HTTP {$csvRes['status']}: ".substr($csvRes['body'],0,200));
-    }
-    $csvRows = parse_csv_rows($csvRes['body']);
-
-    foreach (['cat'=>$cat,'stock'=>$stock,'uoms'=>$uoms,'precio'=>$precio] as $k=>$r) {
-        if ($r['status'] !== 200 || !is_array($r['json'])) {
+    foreach (['cat'=>$cat,'stock'=>$stock,'uoms'=>$uoms,'price'=>$price,'csv'=>$csv] as $k=>$r) {
+        if ($r['status'] !== 200) {
             throw new RuntimeException("$k HTTP {$r['status']}: ".substr($r['body'],0,300));
         }
     }
 
-    $catalog = $cat['json'];
-    $stocks  = $stock['json'];
-    $uomlist = $uoms['json'];
-    $prices  = $precio['json'];
+    $catalog = $cat['json'] ?? [];
+    $stocks  = $stock['json'] ?? [];
+    $uomlist = $uoms['json'] ?? [];
+    $prices  = $price['json'] ?? [];
+    $csvBody = $csv['body'] ?? ''; // CSV vem como texto
 } catch (Throwable $e) {
     log_line('ERRO a obter dados: '.$e->getMessage());
     http_response_code(500);
     echo json_encode(['ok'=>false,'error'=>'Falha a obter dados: '.$e->getMessage()]); exit;
 }
 
-function get_with_body_json_retry(string $url, array $authHeaders, array $body, int $maxAttempts = 3): array {
-    $delayMs = [500, 1000, 2000]; // 0.5s, 1s, 2s
-    $attempt = 0;
-    while (true) {
-        $attempt++;
-        try {
-            $r = http_json('GET', $url, $authHeaders, $body);
-            if ($r['status'] === 200 && is_array($r['json'])) {
-                return $r;
-            }
-            throw new RuntimeException("HTTP {$r['status']}: ".substr($r['body'],0,300));
-        } catch (Throwable $e) {
-            if ($attempt >= $maxAttempts) {
-                throw new RuntimeException("getCatalogo falhou após $attempt tentativas: ".$e->getMessage());
-            }
-            log_line("getCatalogo tentativa $attempt falhou: ".$e->getMessage()." — retry…");
-            usleep($delayMs[$attempt-1] * 1000);
+//////////////////// 3) Parse do CSV (getCsv) ////////////////////
+// Tenta detetar delimitador e mapear cabeçalhos.
+function csv_to_assoc_rows(string $csv): array {
+    if ($csv === '') return [];
+    // normalizar quebras
+    $csv = str_replace(["\r\n", "\r"], "\n", $csv);
+    $lines = explode("\n", $csv);
+    // remove linhas vazias no fim
+    while (count($lines) && trim(end($lines)) === '') array_pop($lines);
+    if (!count($lines)) return [];
+
+    $headerLine = $lines[0];
+    // detetar delimitador
+    $semi = substr_count($headerLine, ';');
+    $comma = substr_count($headerLine, ',');
+    $delim = ($semi > $comma) ? ';' : ',';
+
+    $headers = array_map('trim', str_getcsv($headerLine, $delim));
+    $rows = [];
+    for ($i=1; $i<count($lines); $i++) {
+        $rowLine = $lines[$i];
+        if (trim($rowLine) === '') continue;
+        $cols = str_getcsv($rowLine, $delim);
+        // alinhar tamanhos
+        if (count($cols) < count($headers)) $cols = array_pad($cols, count($headers), '');
+        if (count($cols) > count($headers)) $cols = array_slice($cols, 0, count($headers));
+
+        $assoc = [];
+        foreach ($headers as $ix => $h) {
+            $assoc[$h] = $cols[$ix] ?? '';
         }
+        $rows[] = $assoc;
     }
+    return $rows;
 }
 
-//////////////////// 3) Índices por itemCode ////////////////////
-$index = [];          // base do catálogo
-$stockByItem = [];    // itemCode => stock
-$pricePvpByItem = []; // itemCode => pvp (Price)
-$wholesaleByItem = []; // itemCode => PVP do CSV (PriceWholesale)
-$unitRowsByItem = []; // itemCode => [rows uom]
+// encontra a melhor coluna para itemCode no CSV
+function find_code_column(array $headers): ?string {
+    $cands = [
+        'itemCode','ItemCode','itemcode',
+        'codigo','Codigo','Código','C\u00f3digo','código',
+        'sku','SKU',
+        'reference','Reference'
+    ];
+    foreach ($cands as $c) {
+        foreach ($headers as $h) {
+            if (strcasecmp($h, $c) === 0) return $h;
+        }
+    }
+    // fallback: se houver exatamente 'itemCode' com espaços/brancos
+    foreach ($headers as $h) {
+        if (stripos(preg_replace('/\s+/', '', $h), 'itemcode') !== false) return $h;
+    }
+    return null;
+}
 
-// base (catálogo)
+$csvRows = csv_to_assoc_rows($csvBody);
+$csvPriceWholesale = []; // itemCode => PVP (wholesale no pedido)
+if ($csvRows) {
+    $headers = array_keys($csvRows[0]);
+    $codeCol = find_code_column($headers);
+    // coluna do PVP
+    $pvpCol = null;
+    foreach ($headers as $h) {
+        if (strcasecmp($h, 'PVP') === 0) { $pvpCol = $h; break; }
+    }
+
+    if ($codeCol && $pvpCol) {
+        foreach ($csvRows as $r) {
+            $ic  = trim((string)($r[$codeCol] ?? ''));
+            $pvp = trim((string)($r[$pvpCol]  ?? ''));
+            if ($ic === '') continue;
+            // normalizar número ( , -> . )
+            $pvpNorm = str_replace([' ', "\u{00A0}"], '', $pvp);
+            $pvpNorm = str_replace('.', '', $pvpNorm); // remover separador milhar
+            $pvpNorm = str_replace(',', '.', $pvpNorm); // vírgula decimal -> ponto
+            $val = is_numeric($pvpNorm) ? (float)$pvpNorm : null;
+            if ($val !== null) $csvPriceWholesale[$ic] = $val;
+        }
+        log_line('CSV: mapeados '.count($csvPriceWholesale).' PriceWholesale por itemCode (campo PVP).');
+    } else {
+        log_line('AVISO: não encontrei colunas para itemCode/PVP no CSV; PriceWholesale ficará vazio.');
+    }
+} else {
+    log_line('AVISO: resposta de getCsv vazia ou não parseável.');
+}
+
+//////////////////// 4) Merge por itemCode + peso grams ////////////////////
+$index = []; // itemCode => row base
 foreach ($catalog as $row) {
     if (!isset($row['itemCode'])) continue;
     $ic = (string)$row['itemCode'];
@@ -301,98 +301,58 @@ foreach ($catalog as $row) {
     }
     $index[$ic] = $row;
 }
-
-// stock
 foreach ($stocks as $s) {
     if (!isset($s['itemCode'])) continue;
-    $stockByItem[(string)$s['itemCode']] = $s['stock'] ?? null;
+    $ic = (string)$s['itemCode'];
+    $index[$ic]['stock'] = $s['stock'] ?? null;
 }
-
-// preços JSON → usamos **pvp** para "Price"
 foreach ($prices as $p) {
     if (!isset($p['itemCode'])) continue;
     $ic = (string)$p['itemCode'];
-    $pricePvpByItem[$ic] = $p['pvp'] ?? null; // Price final
+    // price do endpoint continua disponível se precisares noutros usos
+    $index[$ic]['price_api'] = $p['price'] ?? null; // não exportado agora
+    // PEDIDO: Price = pvp do getPrecio
+    $index[$ic]['pvp']       = $p['pvp']   ?? null;
 }
-
-// unidades (peso)
+// unidades → escolher "Unidad" se existir; peso em kg → grams
+$uByIc = [];
 foreach ($uomlist as $u) {
     if (!isset($u['itemCode'])) continue;
-    $unitRowsByItem[(string)$u['itemCode']][] = $u;
+    $ic = (string)$u['itemCode'];
+    $uByIc[$ic][] = $u;
 }
-
-// CSV (getCsv) → mapear "PVP" por itemCode para "PriceWholesale"
-if ($csvRows) {
-    // localizar nomes de colunas (case-insensitive) comuns
-    // itemCode: itemCode | sku | codigo | reference
-    // PVP: PVP | pvp | price_wholesale | wholesale
-    foreach ($csvRows as $r) {
-        // tentar identificar chaves
-        $keys = array_change_key_case($r, CASE_LOWER);
-        $ic = $keys['itemcode'] ?? ($keys['sku'] ?? ($keys['codigo'] ?? ($keys['reference'] ?? null)));
-        if (!$ic) continue;
-        $ic = (string)$ic;
-
-        $pvp = null;
-        if (array_key_exists('pvp', $keys)) $pvp = $keys['pvp'];
-        elseif (array_key_exists('price_wholesale', $keys)) $pvp = $keys['price_wholesale'];
-        elseif (array_key_exists('wholesale', $keys)) $pvp = $keys['wholesale'];
-
-        if ($pvp !== null && $pvp !== '') {
-            // normalizar decimal (troca vírgula por ponto)
-            $s = trim((string)$pvp);
-            $s = str_replace([' ', "\u{00A0}"], '', $s);
-            if (strpos($s, ',') !== false && strpos($s, '.') === false) {
-                $s = str_replace(',', '.', $s);
-            } else {
-                // remover milhar
-                $s = preg_replace('/\.(?=\d{3}\b)/', '', $s);
-                $s = str_replace(',', '.', $s);
-            }
-            $wholesaleByItem[$ic] = is_numeric($s) ? (float)$s : $s;
-        }
+foreach ($uByIc as $ic => $rows) {
+    $chosen = null;
+    foreach ($rows as $u) {
+        if (isset($u['uomCode']) && strcasecmp((string)$u['uomCode'], 'Unidad') === 0) { $chosen = $u; break; }
+    }
+    $chosen = $chosen ?? $rows[0];
+    if (isset($chosen['weight']) && is_numeric($chosen['weight'])) {
+        $kg = (float)$chosen['weight'];
+        $index[$ic]['weight']        = $kg;
+        $index[$ic]['weight_grams']  = (int)round($kg * 1000);
     }
 }
-
-//////////////////// 4) Merge + peso em gramas ////////////////////
-foreach ($index as $ic => &$row) {
-    $row['stock'] = $stockByItem[$ic] ?? null;
-
-    // Price: pvp do JSON getPrecio
-    $row['pvp']   = $pricePvpByItem[$ic] ?? null;
-
-    // PriceWholesale: PVP do CSV getCsv
-    $row['price_wholesale'] = $wholesaleByItem[$ic] ?? null;
-
-    // Unidades/peso → preferir "Unidad"
-    $urows = $unitRowsByItem[$ic] ?? [];
-    if ($urows) {
-        $chosen = null;
-        foreach ($urows as $u) {
-            if (isset($u['uomCode']) && strcasecmp((string)$u['uomCode'], 'Unidad') === 0) {
-                $chosen = $u; break;
-            }
-        }
-        $chosen = $chosen ?? $urows[0];
-        if (isset($chosen['weight']) && is_numeric($chosen['weight'])) {
-            $kg = (float)$chosen['weight'];
-            $row['weight']        = $kg;
-            $row['weight_grams']  = (int)round($kg * 1000);
-        }
-    }
+// NOVO: PriceWholesale do CSV (campo PVP)
+foreach ($csvPriceWholesale as $ic => $wh) {
+    if (!isset($index[$ic])) continue; // só mapeia se existir no catálogo
+    $index[$ic]['price_wholesale'] = $wh;
 }
-unset($row);
 
 $merged = array_values($index);
 
 //////////////////// 5) Filtrar por fabricante e exportar CSV ////////////////////
 $MANUFACTURERS = ['Milwaukee','Garden HighPro','Qnubu','Zerum'];
+
+// Mapa de exportação ACTUALIZADO:
+//  - PriceWholesale => price_wholesale (novo, do CSV.PVP)
+//  - Price          => pvp            (do getPrecio.pvp)
 $EXPORT_MAP = [
     'itemCode'        => 'SKU',
     'productName'     => 'Title',
     'stock'           => 'Stock',
-    'price_wholesale' => 'PriceWholesale', // <- do CSV getCsv (coluna PVP)
-    'pvp'             => 'Price',          // <- do JSON getPrecio (campo pvp)
+    'price_wholesale' => 'PriceWholesale',
+    'pvp'             => 'Price',
     'weight_grams'    => 'Weight',
 ];
 
@@ -416,7 +376,7 @@ foreach ($MANUFACTURERS as $brand) {
 
     // cabeçalho
     fputcsv($fh, array_values($EXPORT_MAP));
-
+    // linhas
     foreach ($rows as $r) {
         $line = [];
         foreach ($EXPORT_MAP as $src => $_pretty) {
@@ -448,7 +408,7 @@ $links = array_map(fn($p) => '<li><code>'.$rel($p).'</code></li>', $written);
 $dashboard = "<!doctype html><html><head><meta charset='utf-8'><title>Catalog Runner</title></head><body><h1>CSV gerados</h1><ul>".implode('', $links)."</ul><p>Run: {$runId}</p></body></html>";
 @file_put_contents($dashFile, $dashboard);
 
-//////////////////// 7) Saída amigável em web ////////////////////
+//////////////////// 7) Saída em web ////////////////////
 if (php_sapi_name() !== 'cli') {
     header('Content-Type: application/json');
     echo json_encode([
