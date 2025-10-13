@@ -3,20 +3,20 @@
 /**
  * Natural Systems Fetcher — Web/CLI safe (PHP 8+)
  *
- * - Login: POST /login  body: { "apiKey": "<ENV NATURALSYSTEMS_API_KEY>" }
- * - GET /producto/getCatalogo  com body JSON { "lang": 2 }  (sim, GET com corpo)
- * - GET /producto/getStock
- * - GET /producto/getUnidadMedida
- * - GET /producto/getPrecio
+ * ALTERAÇÕES:
+ * - "Price"      => vem de GET /producto/getPrecio (JSON), campo **pvp**
+ * - "Wholesale"  => vem de GET /producto/getCsv (CSV), coluna **PVP**
  *
- * Merge por itemCode; peso kg→grams; exporta 4 CSVs por marca:
+ * Endpoints usados:
+ * - POST /login                        body: { "apiKey": "<ENV NATURALSYSTEMS_API_KEY>" }
+ * - GET  /producto/getCatalogo         body JSON: { "lang": 2 }   (sim, GET com corpo)
+ * - GET  /producto/getStock
+ * - GET  /producto/getUnidadMedida
+ * - GET  /producto/getPrecio
+ * - GET  /producto/getCsv              (resposta em CSV)
+ *
+ * Export por marca (Milwaukee, Garden HighPro, Qnubu, Zerum):
  *   SKU, Title, Stock, PriceWholesale, Price, Weight
- *
- * ENV obrigatória:
- *   NATURALSYSTEMS_API_KEY
- *
- * Pastas:
- *   ./output/csv, ./output/logs, ./output/dashboard (com fallback para /tmp)
  */
 
 //////////////////// Setup básico (web/CLI) ////////////////////
@@ -48,9 +48,10 @@ function log_line(string $line): void {
     $msg = "[$ts] $line\n";
     @file_put_contents($RUN_LOG, $msg, FILE_APPEND);
     @file_put_contents($APP_LOG, $msg, FILE_APPEND);
-    error_log('[catalog-runner] ' . $line); // aparece nos logs da Render
+    error_log('[catalog-runner] ' . $line); // aparece nos logs da plataforma
 }
 
+//////////////////// HTTP helpers (JSON e CSV) ////////////////////
 function http_json(
     string $method,
     string $url,
@@ -61,7 +62,6 @@ function http_json(
 ): array {
     $ch = curl_init();
 
-    // Query string
     if ($query && count($query)) {
         $sep = (str_contains($url, '?') ? '&' : '?');
         $url .= $sep . http_build_query($query);
@@ -72,7 +72,7 @@ function http_json(
     $opts = [
         CURLOPT_URL            => $url,
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HEADER         => true,   // para separar headers/body
+        CURLOPT_HEADER         => true,
         CURLOPT_TIMEOUT        => $timeout,
         CURLOPT_CONNECTTIMEOUT => 20,
         CURLOPT_HTTPHEADER     => $hdrs,
@@ -85,7 +85,7 @@ function http_json(
         $opts[CURLOPT_CUSTOMREQUEST] = $m;
     }
 
-    // IMPORTANTE: permitir body JSON mesmo em GET (este fornecedor usa!)
+    // este fornecedor aceita body JSON em GET (getCatalogo)
     if ($jsonBody !== null) {
         $payload = json_encode($jsonBody, JSON_UNESCAPED_UNICODE);
         $opts[CURLOPT_POSTFIELDS] = $payload;
@@ -118,6 +118,89 @@ function http_json(
     return ['status' => $status, 'headers' => $rawHeaders, 'body' => $body, 'json' => $json];
 }
 
+function http_raw(
+    string $method,
+    string $url,
+    array $headers = [],
+    ?array $query = null,
+    int $timeout = 60
+): array {
+    $ch = curl_init();
+
+    if ($query && count($query)) {
+        $sep = (str_contains($url, '?') ? '&' : '?');
+        $url .= $sep . http_build_query($query);
+    }
+
+    $opts = [
+        CURLOPT_URL            => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HEADER         => true,
+        CURLOPT_TIMEOUT        => $timeout,
+        CURLOPT_CONNECTTIMEOUT => 20,
+        CURLOPT_HTTPHEADER     => $headers,
+    ];
+
+    $m = strtoupper($method);
+    if ($m === 'POST') {
+        $opts[CURLOPT_POST] = true;
+    } else {
+        $opts[CURLOPT_CUSTOMREQUEST] = $m;
+    }
+
+    curl_setopt_array($ch, $opts);
+    $response = curl_exec($ch);
+    if ($response === false) {
+        $err = curl_error($ch);
+        curl_close($ch);
+        throw new RuntimeException("Network error: $err");
+    }
+    $status     = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+    curl_close($ch);
+
+    $rawHeaders = substr($response, 0, $headerSize);
+    $body       = substr($response, $headerSize);
+
+    log_line(sprintf("%s %s -> %d (raw)", $m, $url, $status));
+    return ['status' => $status, 'headers' => $rawHeaders, 'body' => $body];
+}
+
+//////////////////// CSV helpers ////////////////////
+function autodetect_delimiter(string $headerLine): string {
+    $cComma = substr_count($headerLine, ',');
+    $cSemi  = substr_count($headerLine, ';');
+    $cTab   = substr_count($headerLine, "\t");
+    $max = max($cComma, $cSemi, $cTab);
+    if ($max === $cSemi)  return ';';
+    if ($max === $cTab)   return "\t";
+    return ','; // default
+}
+
+function parse_csv_rows(string $csv): array {
+    $lines = preg_split("/\r\n|\n|\r/", $csv);
+    if (!$lines || count($lines) < 1) return [];
+    $delim = autodetect_delimiter($lines[0]);
+
+    // headers
+    $headers = str_getcsv($lines[0], $delim);
+    $headers = array_map(static fn($h) => trim((string)$h), $headers);
+    $rows = [];
+
+    for ($i = 1; $i < count($lines); $i++) {
+        if ($lines[$i] === '' || $lines[$i] === false) continue;
+        $vals = str_getcsv($lines[$i], $delim);
+        if (!$vals || count($vals) === 1 && $vals[0] === null) continue;
+
+        $row = [];
+        foreach ($headers as $k => $h) {
+            $row[$h] = $vals[$k] ?? null;
+        }
+        $rows[] = $row;
+    }
+    return $rows;
+}
+
 //////////////////// Config API ////////////////////
 $BASE_URL  = 'https://api.naturalsystems.es/api';
 $API_KEY   = getenv('NATURALSYSTEMS_API_KEY') ?: '';
@@ -127,11 +210,9 @@ if (!$API_KEY) {
     http_response_code(500);
     echo json_encode(['ok'=>false,'error'=>'NATURALSYSTEMS_API_KEY missing']); exit;
 }
-// sanear key (remove aspas/brancos acidentais)
-$API_KEY = trim($API_KEY);
-$API_KEY = trim($API_KEY, "\"' \t\n\r");
+$API_KEY = trim(trim($API_KEY), "\"' \t\n\r");
 
-//////////////////// 1) Login → token (24h) ////////////////////
+//////////////////// 1) Login → token ////////////////////
 try {
     log_line('Login: a obter token…');
     $resp = http_json('POST', "$BASE_URL/login", [], ['apiKey' => $API_KEY]);
@@ -151,16 +232,23 @@ try {
 
 $AUTH = ['Authorization: Bearer '.$token];
 
-//////////////////// 2) GET datasets (cat com body JSON lang=2) ////////////////////
+//////////////////// 2) GET datasets ////////////////////
 try {
-    // getCatalogo: GET com body JSON { "lang": 2 } (como no teu exemplo Guzzle)
+    // getCatalogo — GET com body JSON {lang:2}, com retry
     $cat = get_with_body_json_retry("$BASE_URL/producto/getCatalogo", $AUTH, ['lang'=>2], 3);
 
-    $stock = http_json('GET', "$BASE_URL/producto/getStock", $AUTH);
-    $uoms  = http_json('GET', "$BASE_URL/producto/getUnidadMedida", $AUTH);
-    $price = http_json('GET', "$BASE_URL/producto/getPrecio", $AUTH);
+    $stock  = http_json('GET', "$BASE_URL/producto/getStock", $AUTH);
+    $uoms   = http_json('GET', "$BASE_URL/producto/getUnidadMedida", $AUTH);
+    $precio = http_json('GET', "$BASE_URL/producto/getPrecio", $AUTH);
 
-    foreach (['cat'=>$cat,'stock'=>$stock,'uoms'=>$uoms,'price'=>$price] as $k=>$r) {
+    // Novo: catálogo CSV (para PriceWholesale = coluna PVP)
+    $csvRes = http_raw('GET', "$BASE_URL/producto/getCsv", array_merge($AUTH, ['Accept: text/csv,*/*;q=0.8']));
+    if ($csvRes['status'] !== 200) {
+        throw new RuntimeException("getCsv HTTP {$csvRes['status']}: ".substr($csvRes['body'],0,200));
+    }
+    $csvRows = parse_csv_rows($csvRes['body']);
+
+    foreach (['cat'=>$cat,'stock'=>$stock,'uoms'=>$uoms,'precio'=>$precio] as $k=>$r) {
         if ($r['status'] !== 200 || !is_array($r['json'])) {
             throw new RuntimeException("$k HTTP {$r['status']}: ".substr($r['body'],0,300));
         }
@@ -169,7 +257,7 @@ try {
     $catalog = $cat['json'];
     $stocks  = $stock['json'];
     $uomlist = $uoms['json'];
-    $prices  = $price['json'];
+    $prices  = $precio['json'];
 } catch (Throwable $e) {
     log_line('ERRO a obter dados: '.$e->getMessage());
     http_response_code(500);
@@ -186,7 +274,6 @@ function get_with_body_json_retry(string $url, array $authHeaders, array $body, 
             if ($r['status'] === 200 && is_array($r['json'])) {
                 return $r;
             }
-            // se não veio 200/JSON, lança para cair no retry
             throw new RuntimeException("HTTP {$r['status']}: ".substr($r['body'],0,300));
         } catch (Throwable $e) {
             if ($attempt >= $maxAttempts) {
@@ -198,59 +285,115 @@ function get_with_body_json_retry(string $url, array $authHeaders, array $body, 
     }
 }
 
-//////////////////// 3) Merge por itemCode + peso grams ////////////////////
-$index = []; // itemCode => row base
+//////////////////// 3) Índices por itemCode ////////////////////
+$index = [];          // base do catálogo
+$stockByItem = [];    // itemCode => stock
+$pricePvpByItem = []; // itemCode => pvp (Price)
+$wholesaleByItem = []; // itemCode => PVP do CSV (PriceWholesale)
+$unitRowsByItem = []; // itemCode => [rows uom]
+
+// base (catálogo)
 foreach ($catalog as $row) {
     if (!isset($row['itemCode'])) continue;
     $ic = (string)$row['itemCode'];
-    // normaliza imagens para string (se viesse array)
     if (isset($row['images']) && is_array($row['images'])) {
         $row['images'] = implode('|', $row['images']);
     }
     $index[$ic] = $row;
 }
+
+// stock
 foreach ($stocks as $s) {
     if (!isset($s['itemCode'])) continue;
-    $ic = (string)$s['itemCode'];
-    $index[$ic]['stock'] = $s['stock'] ?? null;
+    $stockByItem[(string)$s['itemCode']] = $s['stock'] ?? null;
 }
+
+// preços JSON → usamos **pvp** para "Price"
 foreach ($prices as $p) {
     if (!isset($p['itemCode'])) continue;
     $ic = (string)$p['itemCode'];
-    $index[$ic]['price'] = $p['price'] ?? null;
-    $index[$ic]['pvp']   = $p['pvp']   ?? null;
+    $pricePvpByItem[$ic] = $p['pvp'] ?? null; // Price final
 }
-// unidades → escolher "Unidad" se existir; peso em kg → grams
-$uByIc = [];
+
+// unidades (peso)
 foreach ($uomlist as $u) {
     if (!isset($u['itemCode'])) continue;
-    $ic = (string)$u['itemCode'];
-    $uByIc[$ic][] = $u;
+    $unitRowsByItem[(string)$u['itemCode']][] = $u;
 }
-foreach ($uByIc as $ic => $rows) {
-    $chosen = null;
-    foreach ($rows as $u) {
-        if (isset($u['uomCode']) && strcasecmp((string)$u['uomCode'], 'Unidad') === 0) { $chosen = $u; break; }
-    }
-    $chosen = $chosen ?? $rows[0];
-    if (isset($chosen['weight']) && is_numeric($chosen['weight'])) {
-        $kg = (float)$chosen['weight'];
-        $index[$ic]['weight']        = $kg;
-        $index[$ic]['weight_grams']  = (int)round($kg * 1000);
+
+// CSV (getCsv) → mapear "PVP" por itemCode para "PriceWholesale"
+if ($csvRows) {
+    // localizar nomes de colunas (case-insensitive) comuns
+    // itemCode: itemCode | sku | codigo | reference
+    // PVP: PVP | pvp | price_wholesale | wholesale
+    foreach ($csvRows as $r) {
+        // tentar identificar chaves
+        $keys = array_change_key_case($r, CASE_LOWER);
+        $ic = $keys['itemcode'] ?? ($keys['sku'] ?? ($keys['codigo'] ?? ($keys['reference'] ?? null)));
+        if (!$ic) continue;
+        $ic = (string)$ic;
+
+        $pvp = null;
+        if (array_key_exists('pvp', $keys)) $pvp = $keys['pvp'];
+        elseif (array_key_exists('price_wholesale', $keys)) $pvp = $keys['price_wholesale'];
+        elseif (array_key_exists('wholesale', $keys)) $pvp = $keys['wholesale'];
+
+        if ($pvp !== null && $pvp !== '') {
+            // normalizar decimal (troca vírgula por ponto)
+            $s = trim((string)$pvp);
+            $s = str_replace([' ', "\u{00A0}"], '', $s);
+            if (strpos($s, ',') !== false && strpos($s, '.') === false) {
+                $s = str_replace(',', '.', $s);
+            } else {
+                // remover milhar
+                $s = preg_replace('/\.(?=\d{3}\b)/', '', $s);
+                $s = str_replace(',', '.', $s);
+            }
+            $wholesaleByItem[$ic] = is_numeric($s) ? (float)$s : $s;
+        }
     }
 }
+
+//////////////////// 4) Merge + peso em gramas ////////////////////
+foreach ($index as $ic => &$row) {
+    $row['stock'] = $stockByItem[$ic] ?? null;
+
+    // Price: pvp do JSON getPrecio
+    $row['pvp']   = $pricePvpByItem[$ic] ?? null;
+
+    // PriceWholesale: PVP do CSV getCsv
+    $row['price_wholesale'] = $wholesaleByItem[$ic] ?? null;
+
+    // Unidades/peso → preferir "Unidad"
+    $urows = $unitRowsByItem[$ic] ?? [];
+    if ($urows) {
+        $chosen = null;
+        foreach ($urows as $u) {
+            if (isset($u['uomCode']) && strcasecmp((string)$u['uomCode'], 'Unidad') === 0) {
+                $chosen = $u; break;
+            }
+        }
+        $chosen = $chosen ?? $urows[0];
+        if (isset($chosen['weight']) && is_numeric($chosen['weight'])) {
+            $kg = (float)$chosen['weight'];
+            $row['weight']        = $kg;
+            $row['weight_grams']  = (int)round($kg * 1000);
+        }
+    }
+}
+unset($row);
 
 $merged = array_values($index);
 
-//////////////////// 4) Filtrar por fabricante e exportar CSV ////////////////////
+//////////////////// 5) Filtrar por fabricante e exportar CSV ////////////////////
 $MANUFACTURERS = ['Milwaukee','Garden HighPro','Qnubu','Zerum'];
 $EXPORT_MAP = [
-    'itemCode'     => 'SKU',
-    'productName'  => 'Title',
-    'stock'        => 'Stock',
-    'price'        => 'PriceWholesale',
-    'pvp'          => 'Price',
-    'weight_grams' => 'Weight',
+    'itemCode'        => 'SKU',
+    'productName'     => 'Title',
+    'stock'           => 'Stock',
+    'price_wholesale' => 'PriceWholesale', // <- do CSV getCsv (coluna PVP)
+    'pvp'             => 'Price',          // <- do JSON getPrecio (campo pvp)
+    'weight_grams'    => 'Weight',
 ];
 
 @mkdir($CSV_DIR, 0775, true);
@@ -273,7 +416,7 @@ foreach ($MANUFACTURERS as $brand) {
 
     // cabeçalho
     fputcsv($fh, array_values($EXPORT_MAP));
-    // linhas
+
     foreach ($rows as $r) {
         $line = [];
         foreach ($EXPORT_MAP as $src => $_pretty) {
@@ -290,7 +433,7 @@ foreach ($MANUFACTURERS as $brand) {
     log_line("CSV: $file (" . count($rows) . " linhas)");
 }
 
-//////////////////// 5) Mini dashboard ////////////////////
+//////////////////// 6) Mini dashboard ////////////////////
 $dashFile = $DASH_DIR . '/index.html';
 @mkdir($DASH_DIR, 0775, true);
 if (!is_dir($DASH_DIR) || !is_writable($DASH_DIR)) {
@@ -305,7 +448,7 @@ $links = array_map(fn($p) => '<li><code>'.$rel($p).'</code></li>', $written);
 $dashboard = "<!doctype html><html><head><meta charset='utf-8'><title>Catalog Runner</title></head><body><h1>CSV gerados</h1><ul>".implode('', $links)."</ul><p>Run: {$runId}</p></body></html>";
 @file_put_contents($dashFile, $dashboard);
 
-//////////////////// 6) Saída amigável em web ////////////////////
+//////////////////// 7) Saída amigável em web ////////////////////
 if (php_sapi_name() !== 'cli') {
     header('Content-Type: application/json');
     echo json_encode([
